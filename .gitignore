@@ -4,3 +4,11 @@ build/
 !.idea/runConfigurations/
 SolarEdge-Exporter.log
 .env
+
+# Local registry build/push helper.
+/build.sh
+
+# Local network captures may contain private device data.
+*.pcap
+*.pcapng
+*.cap

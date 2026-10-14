@@ -83,6 +83,76 @@ no zero-valued meter metrics are exported on systems without a meter.
 A sample Grafana dashboard is available in
 [grafana/SolarEdgeExporter.json](grafana/SolarEdgeExporter.json).
 
+## Session recovery
+
+On connection, protocol, parsing, or detected-meter read failures, the exporter
+closes and discards the entire Modbus session. Each retry uses a fresh handler,
+re-reads inverter metadata, and rediscovers enabled meters before polling.
+Transaction-ID validation remains strict: only a reply matching the current
+request can become a measurement. The transport discards up to three complete
+unmatched replies per request, logging each discard, then waits for the matching
+reply within the original 10-second deadline. Requests are not resent and stale
+replies do not extend the deadline. Exceeding the limit, timing out, or receiving
+an invalid frame triggers session reinitialization. Protocol and unit IDs,
+frame lengths, and matching-response function codes are still validated.
+
+Consecutive failed attempts wait **2, 4, 8, 16, then 30 seconds**, capped at
+30 seconds. Backoff resets only after a complete successful collection cycle,
+not merely a successful TCP connection. Polling and retry waits are interruptible
+on shutdown; cancellation also closes active sockets and interrupts connection
+attempts. Network operations retain their 10-second timeout.
+This improves recovery but cannot guarantee recovery from an inverter or
+network fault. Use the health metrics below to detect ongoing outages.
+
+## Collection health and stale data
+
+Prometheus `up` only indicates that `/metrics` is reachable, not that inverter
+polling works. Two additional metrics carry the same `inverter="host:port"`
+label as the measurements:
+
+* `solaredge_collection_success`: `1` when the latest cycle read the inverter,
+  completed meter detection, and read all detected meters; `0` on failure or
+  before the first completed cycle. An absent/disabled meter is not a failure.
+* `solaredge_collection_last_success_timestamp_seconds`: time of the last
+  successful complete cycle, or `0` if none has succeeded since startup.
+  Failed cycles leave this timestamp unchanged.
+
+Existing measurements remain cached on failures for compatibility. Check these
+health metrics before trusting them. They describe complete-cycle health, so a
+meter failure can mark collection unhealthy even if inverter values updated.
+Check both success and age: during a blocked read, success can still describe
+an earlier cycle. Choose an age threshold above your polling interval and
+expected read duration (particularly with multiple meters).
+
+Example Prometheus alert rules (adjust thresholds for your configuration):
+
+```yaml
+groups:
+  - name: solaredge
+    rules:
+      - alert: SolarEdgeCollectionFailed
+        expr: solaredge_collection_success == 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "SolarEdge collection failing for {{ $labels.inverter }}"
+      - alert: SolarEdgeDataStale
+        expr: time() - solaredge_collection_last_success_timestamp_seconds > 60
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "SolarEdge data stale for {{ $labels.inverter }}"
+      - alert: SolarEdgeExporterDown
+        expr: up{job="solaredge-exporter"} == 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "SolarEdge exporter scrape failing"
+```
+
 ## Metrics
 
 All metrics are labeled with the `inverter` they were read from. In addition
